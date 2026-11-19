@@ -1,0 +1,34 @@
+[package]
+name = "skill-foundry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+license = "Apache-2.0"
+description = "Standalone Agent Skills engineering workbench for Claude Code and Codex: scaffold, validate, package, trigger-eval, description optimizer, token budget linter, skill security vetting, and dual-host BTE cost auditing."
+
+[[bin]]
+name = "skill-foundry"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "=0.4.45", features = ["serde"] }
+libc = "=0.2.191"
+ooxml-numfmt = { path = "vendor/ooxml-numfmt" }
+quick-xml = "0.38"
+regex = "1"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150", features = ["preserve_order"] }
+serde_yaml = "0.9"
+tempfile = "=3.27.0"
+tiny_http = "0.12"
+uuid = { version = "=1.22.0", features = ["v4"] }
+xmltree = "0.11"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = "thin"

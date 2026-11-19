@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "skill-foundry": {
+      "command": "./bin/skill-foundry",
+      "args": ["mcp"],
+      "cwd": ".",
+      "tool_timeout_sec": 900
+    }
+  }
+}

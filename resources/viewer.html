@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Eval Review</title>
+  <style>
+    :root {
+      --bg: #faf9f5;
+      --surface: #ffffff;
+      --border: #e8e6dc;
+      --text: #141413;
+      --text-muted: #75736c;
+      --accent: #d97757;
+      --accent-hover: #c4613f;
+      --green: #788c5d;
+      --green-bg: #eef2e8;
+      --red: #c44;
+      --red-bg: #fceaea;
+      --header-bg: #141413;
+      --header-text: #faf9f5;
+      --radius: 6px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Georgia, serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .header {
+      background: var(--header-bg);
+      color: var(--header-text);
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .header h1 { font-family: system-ui, sans-serif; font-size: 1.25rem; font-weight: 600; }
+    .header .instructions { font-size: 0.8rem; opacity: 0.75; margin-top: 0.25rem; }
+    .header .progress { font-size: 0.875rem; opacity: 0.85; text-align: right; }
+    #app { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+    .view-tabs {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.75rem 2rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .view-tab {
+      padding: 0.45rem 0.9rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      cursor: pointer;
+      font-family: system-ui, sans-serif;
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+    .view-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .view-panel { display: none; flex: 1; min-height: 0; flex-direction: column; }
+    .view-panel.active { display: flex; }
+    .main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.5rem 2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    .section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      flex-shrink: 0;
+    }
+    .section-header {
+      font-family: system-ui, sans-serif;
+      padding: 0.75rem 1rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .section-body { padding: 1rem; }
+    .config-badge {
+      display: inline-block;
+      padding: 0.2rem 0.625rem;
+      border-radius: 9999px;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      margin-left: 0.75rem;
+    }
+    .config-badge.config-primary { background: rgba(33, 150, 243, 0.12); color: #1976d2; }
+    .config-badge.config-baseline { background: rgba(255, 193, 7, 0.15); color: #f57f17; }
+    .prompt-text { white-space: pre-wrap; font-size: 0.9375rem; line-height: 1.6; }
+    .output-file { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .output-file + .output-file { margin-top: 1rem; }
+    .output-file-header {
+      padding: 0.5rem 0.75rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      font-family: monospace;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .dl-btn, .download-link { font-size: 0.78rem; color: var(--accent); text-decoration: none; font-family: system-ui, sans-serif; }
+    .output-file-content { padding: 0.75rem; overflow-x: auto; }
+    .output-file-content pre { font-size: 0.8125rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; font-family: monospace; }
+    .output-file-content img { max-width: 100%; height: auto; border-radius: 4px; }
+    .output-file-content iframe { width: 100%; height: 600px; border: none; }
+    .output-file-content table, .benchmark-table { border-collapse: collapse; font-size: 0.8125rem; width: 100%; }
+    .output-file-content td, .output-file-content th, .benchmark-table td, .benchmark-table th {
+      border: 1px solid var(--border);
+      padding: 0.375rem 0.5rem;
+      text-align: left;
+    }
+    .benchmark-table th { background: var(--bg); font-family: system-ui, sans-serif; }
+    .sheet-label { font-family: system-ui, sans-serif; font-weight: 600; margin: 0.75rem 0 0.35rem; font-size: 0.85rem; }
+    .grades-toggle { cursor: pointer; display: flex; align-items: center; gap: 0.45rem; }
+    .arrow { display: inline-block; transition: transform 0.15s; }
+    .arrow.open { transform: rotate(90deg); }
+    .grades-content { display: none; padding: 1rem; }
+    .grades-content.open { display: block; }
+    .grade-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 600; margin-right: 0.5rem; }
+    .grade-pass { background: var(--green-bg); color: var(--green); }
+    .grade-fail { background: var(--red-bg); color: var(--red); }
+    .assertion-list { list-style: none; margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
+    .assertion-item { padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px; }
+    .assertion-status.pass { color: var(--green); font-weight: 700; margin-right: 0.4rem; }
+    .assertion-status.fail { color: var(--red); font-weight: 700; margin-right: 0.4rem; }
+    .assertion-evidence { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem; }
+    .feedback-textarea { width: 100%; min-height: 90px; padding: 0.65rem; border: 1px solid var(--border); border-radius: 4px; font-family: inherit; }
+    .feedback-status { font-size: 0.78rem; color: var(--text-muted); margin-top: 0.35rem; }
+    .prev-feedback { margin-top: 0.75rem; padding: 0.6rem; background: var(--bg); border-radius: 4px; font-size: 0.85rem; }
+    .prev-feedback-label { font-weight: 600; margin-bottom: 0.25rem; }
+    .nav {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.9rem 2rem;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .nav-btn, .done-btn {
+      padding: 0.55rem 1.15rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      cursor: pointer;
+      font-family: system-ui, sans-serif;
+      font-size: 0.875rem;
+      font-weight: 500;
+    }
+    .nav-btn { background: var(--bg); color: var(--text); }
+    .nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .done-btn { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .done-btn:hover { background: var(--accent-hover); }
+    .benchmark-view { padding: 1.5rem 2rem; overflow-y: auto; flex: 1; }
+    .benchmark-delta-positive { color: var(--green); font-weight: 600; }
+    .benchmark-delta-negative { color: var(--red); font-weight: 600; }
+    .benchmark-notes { margin-top: 1rem; padding: 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+    .empty-state, .benchmark-empty { color: var(--text-muted); font-style: italic; }
+    .done-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+      display: none; align-items: center; justify-content: center;
+    }
+    .done-overlay.visible { display: flex; }
+    .done-card { background: var(--surface); padding: 1.75rem; border-radius: 8px; max-width: 420px; border: 1px solid var(--border); }
+    .done-card h2 { margin-bottom: 0.5rem; font-family: system-ui, sans-serif; }
+    .done-card p { margin-bottom: 1rem; font-size: 0.9rem; line-height: 1.5; }
+    .btn-row { display: flex; justify-content: flex-end; }
+    .btn-row button { padding: 0.5rem 1rem; border: none; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
+    .toast {
+      position: fixed; bottom: 4.5rem; right: 2rem; background: var(--header-bg); color: var(--header-text);
+      padding: 0.55rem 1rem; border-radius: 6px; font-size: 0.85rem; opacity: 0; pointer-events: none; transition: opacity 0.2s;
+    }
+    .toast.visible { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="header">
+      <div>
+        <h1>Eval Review: <span id="skill-name"></span></h1>
+        <div class="instructions">Inspect outputs, check formal assertions, and record review notes.</div>
+      </div>
+      <div class="progress" id="progress"></div>
+    </div>
+    <div class="view-tabs" id="view-tabs" style="display:none;">
+      <button class="view-tab active" data-eval-action="view-outputs">Outputs</button>
+      <button class="view-tab" data-eval-action="view-benchmark">Benchmark</button>
+    </div>
+    <div class="view-panel active" id="panel-outputs">
+      <div class="main">
+        <div class="section">
+          <div class="section-header">Prompt <span class="config-badge" id="config-badge" style="display:none;"></span></div>
+          <div class="section-body"><div class="prompt-text" id="prompt-text"></div></div>
+        </div>
+        <div class="section">
+          <div class="section-header">Output</div>
+          <div class="section-body" id="outputs-body"><div class="empty-state">No output files found</div></div>
+        </div>
+        <div class="section" id="prev-outputs-section" style="display:none;">
+          <div class="section-header">
+            <div class="grades-toggle" data-eval-action="toggle-previous">
+              <span class="arrow" id="prev-outputs-arrow">&#9654;</span> Previous Output
+            </div>
+          </div>
+          <div class="grades-content" id="prev-outputs-content"></div>
+        </div>
+        <div class="section" id="grades-section" style="display:none;">
+          <div class="section-header">
+            <div class="grades-toggle" data-eval-action="toggle-grades">
+              <span class="arrow" id="grades-arrow">&#9654;</span> Formal Grades
+            </div>
+          </div>
+          <div class="grades-content" id="grades-content"></div>
+        </div>
+        <div class="section">
+          <div class="section-header">Your Feedback</div>
+          <div class="section-body">
+            <textarea class="feedback-textarea" id="feedback" placeholder="What do you think of this output? Any issues, suggestions, or things that look great?"></textarea>
+            <div class="feedback-status" id="feedback-status"></div>
+            <div class="prev-feedback" id="prev-feedback" style="display:none;">
+              <div class="prev-feedback-label">Previous feedback</div>
+              <div id="prev-feedback-text"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="nav" id="outputs-nav">
+        <button class="nav-btn" id="prev-btn" data-eval-action="previous">&#8592; Previous</button>
+        <button class="done-btn" id="done-btn" data-eval-action="submit">Submit All Reviews</button>
+        <button class="nav-btn" id="next-btn" data-eval-action="next">Next &#8594;</button>
+      </div>
+    </div>
+    <div class="view-panel" id="panel-benchmark">
+      <div class="benchmark-view" id="benchmark-content">
+        <div class="benchmark-empty">No benchmark data available.</div>
+      </div>
+    </div>
+  </div>
+  <div class="done-overlay" id="done-overlay">
+    <div class="done-card">
+      <h2>Review Complete</h2>
+      <p id="done-message">Your feedback has been saved.</p>
+      <div class="btn-row"><button data-eval-action="close-done">OK</button></div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script id="eval-viewer-data" type="application/json">__EVAL_DATA__</script>
+  <script>
+    (function () {
+      const data = JSON.parse(document.getElementById('eval-viewer-data').textContent || '{}');
+      const runs = Array.isArray(data.runs) ? data.runs : [];
+      const feedback = {};
+      let index = 0;
+      document.getElementById('skill-name').textContent = data.skill_name || 'skill';
+      if (data.benchmark) {
+        document.getElementById('view-tabs').style.display = 'flex';
+        renderBenchmark(data.benchmark);
+      }
+      function esc(s) {
+        return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#x27;'}[c]));
+      }
+      function uriFor(f) {
+        if (f.data_uri) return f.data_uri;
+        if (f.data_b64) return 'data:application/octet-stream;base64,' + f.data_b64;
+        if (f.type === 'text') return 'data:text/plain;charset=utf-8,' + encodeURIComponent(f.content || '');
+        return '#';
+      }
+      function renderFiles(container, files) {
+        container.innerHTML = '';
+        if (!files || !files.length) {
+          container.innerHTML = '<div class="empty-state">No output files</div>';
+          return;
+        }
+        for (const f of files) {
+          const wrap = document.createElement('div');
+          wrap.className = 'output-file';
+          const hdr = document.createElement('div');
+          hdr.className = 'output-file-header';
+          hdr.innerHTML = '<span>' + esc(f.name) + '</span><a class="dl-btn" download="' + esc(f.name) + '" href="' + esc(uriFor(f)) + '">Download</a>';
+          const body = document.createElement('div');
+          body.className = 'output-file-content';
+          if (f.type === 'text' || f.type === 'error') {
+            body.innerHTML = '<pre' + (f.type === 'error' ? ' style="color:var(--red)"' : '') + '>' + esc(f.content) + '</pre>';
+          } else if (f.type === 'image') {
+            body.innerHTML = '<img src="' + esc(f.data_uri || '') + '" alt="' + esc(f.name) + '">';
+          } else if (f.type === 'pdf') {
+            body.innerHTML = '<iframe src="' + esc(f.data_uri || '') + '" title="' + esc(f.name) + '"></iframe>';
+          } else if (f.type === 'xlsx') {
+            if (f.render_error) {
+              body.innerHTML = '<pre>Error rendering spreadsheet: ' + esc(f.render_error) + '</pre>';
+            } else {
+              let html = '';
+              for (const s of (f.worksheets || [])) {
+                html += '<div class="sheet-label">Sheet: ' + esc(s.name) + '</div><table>';
+                const disp = s.display || {};
+                for (let r = 0; r < (s.rows || []).length; r++) {
+                  html += '<tr>';
+                  for (let c = 0; c < s.rows[r].length; c++) {
+                    const key = r + ':' + c;
+                    const v = key in disp ? disp[key] : s.rows[r][c];
+                    html += '<td>' + esc(v ?? '') + '</td>';
+                  }
+                  html += '</tr>';
+                }
+                html += '</table>';
+              }
+              body.innerHTML = html || '<div class="empty-state">Empty workbook</div>';
+            }
+          } else {
+            body.innerHTML = '<a class="download-link" download="' + esc(f.name) + '" href="' + esc(uriFor(f)) + '">Download ' + esc(f.name) + '</a>';
+          }
+          wrap.appendChild(hdr);
+          wrap.appendChild(body);
+          container.appendChild(wrap);
+        }
+      }
+      function renderRun(i) {
+        if (!runs.length) return;
+        index = Math.max(0, Math.min(runs.length - 1, i));
+        const run = runs[index];
+        document.getElementById('progress').textContent = (index + 1) + ' of ' + runs.length;
+        document.getElementById('prompt-text').textContent = run.prompt || '';
+        const badge = document.getElementById('config-badge');
+        if (run.configuration) {
+          badge.style.display = 'inline-block';
+          badge.className = 'config-badge ' + (String(run.configuration).includes('without') ? 'config-baseline' : 'config-primary');
+          badge.textContent = run.configuration;
+        } else {
+          badge.style.display = 'none';
+        }
+        renderFiles(document.getElementById('outputs-body'), run.outputs || []);
+        const prevOuts = (data.previous_outputs || {})[run.id];
+        const prevSec = document.getElementById('prev-outputs-section');
+        if (prevOuts && prevOuts.length) {
+          prevSec.style.display = 'block';
+          renderFiles(document.getElementById('prev-outputs-content'), prevOuts);
+        } else {
+          prevSec.style.display = 'none';
+        }
+        const gradesSec = document.getElementById('grades-section');
+        const gradesContent = document.getElementById('grades-content');
+        if (run.grading) {
+          gradesSec.style.display = 'block';
+          const sum = run.grading.summary || {};
+          const rate = typeof sum.pass_rate === 'number' ? Math.round(sum.pass_rate * 100) + '%' : '?';
+          const cls = (sum.pass_rate || 0) >= 0.8 ? 'grade-pass' : 'grade-fail';
+          let html = '<div class="grades-summary"><span class="grade-badge ' + cls + '">' + rate + '</span>' +
+            esc(sum.passed || 0) + ' passed, ' + esc(sum.failed || 0) + ' failed of ' + esc(sum.total || 0) + '</div><ul class="assertion-list">';
+          for (const e of (run.grading.expectations || [])) {
+            html += '<li class="assertion-item"><span class="assertion-status ' + (e.passed ? 'pass' : 'fail') + '">' + (e.passed ? '✓' : '✗') + '</span><span>' + esc(e.text) + '</span>' +
+              (e.evidence ? '<div class="assertion-evidence">' + esc(e.evidence) + '</div>' : '') + '</li>';
+          }
+          gradesContent.innerHTML = html + '</ul>';
+        } else {
+          gradesSec.style.display = 'none';
+        }
+        const prevFb = (data.previous_feedback || {})[run.id];
+        const prevFbBox = document.getElementById('prev-feedback');
+        if (prevFb) {
+          prevFbBox.style.display = 'block';
+          document.getElementById('prev-feedback-text').textContent = prevFb;
+        } else {
+          prevFbBox.style.display = 'none';
+        }
+        document.getElementById('feedback').value = feedback[run.id] || '';
+        document.getElementById('prev-btn').disabled = index === 0;
+        document.getElementById('next-btn').disabled = index === runs.length - 1;
+      }
+      function renderBenchmark(b) {
+        const order = b.configuration_order || Object.keys(b.run_summary || {}).filter(k => k !== 'delta');
+        let html = '<table class="benchmark-table"><thead><tr><th>Configuration</th><th>Pass Rate</th><th>Time (s)</th><th>Tokens</th></tr></thead><tbody>';
+        for (const cfg of order) {
+          const s = (b.run_summary || {})[cfg] || {};
+          html += '<tr><td>' + esc(cfg) + '</td><td>' + ((s.pass_rate?.mean || 0) * 100).toFixed(0) + '%</td><td>' + (s.time_seconds?.mean || 0).toFixed(1) + '</td><td>' + Math.round(s.tokens?.mean || 0) + '</td></tr>';
+        }
+        if (b.run_summary?.delta) {
+          const d = b.run_summary.delta;
+          html += '<tr><td><b>Delta</b></td><td>' + esc(d.pass_rate) + '</td><td>' + esc(d.time_seconds) + '</td><td>' + esc(d.tokens) + '</td></tr>';
+        }
+        html += '</tbody></table>';
+        if (Array.isArray(b.notes) && b.notes.length) {
+          html += '<div class="benchmark-notes"><h3>Notes</h3><ul>' + b.notes.map(n => '<li>' + esc(n) + '</li>').join('') + '</ul></div>';
+        }
+        document.getElementById('benchmark-content').innerHTML = html;
+      }
+      async function saveFeedback(showDone) {
+        const payload = { reviews: Object.entries(feedback).map(([run_id, text]) => ({ run_id, feedback: text })) };
+        if (data.standalone) {
+          const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = 'feedback.json';
+          a.click();
+          if (showDone) document.getElementById('done-overlay').classList.add('visible');
+          return;
+        }
+        try {
+          const res = await fetch('/api/feedback', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          document.getElementById('feedback-status').textContent = res.ok ? 'Saved' : 'Save failed';
+          if (res.ok && showDone) document.getElementById('done-overlay').classList.add('visible');
+        } catch (err) {
+          document.getElementById('feedback-status').textContent = 'Save error: ' + err;
+        }
+      }
+      document.getElementById('feedback').addEventListener('input', ev => {
+        if (runs[index]) feedback[runs[index].id] = ev.target.value;
+      });
+      document.addEventListener('click', ev => {
+        const btn = ev.target.closest('[data-eval-action]');
+        if (!btn) return;
+        const act = btn.getAttribute('data-eval-action');
+        if (act === 'previous') renderRun(index - 1);
+        else if (act === 'next') renderRun(index + 1);
+        else if (act === 'submit') saveFeedback(true);
+        else if (act === 'close-done') document.getElementById('done-overlay').classList.remove('visible');
+        else if (act === 'toggle-grades') {
+          document.getElementById('grades-content').classList.toggle('open');
+          document.getElementById('grades-arrow').classList.toggle('open');
+        } else if (act === 'toggle-previous') {
+          document.getElementById('prev-outputs-content').classList.toggle('open');
+          document.getElementById('prev-outputs-arrow').classList.toggle('open');
+        } else if (act === 'view-outputs' || act === 'view-benchmark') {
+          document.querySelectorAll('.view-tab').forEach(t => t.classList.toggle('active', t === btn));
+          document.getElementById('panel-outputs').classList.toggle('active', act === 'view-outputs');
+          document.getElementById('panel-benchmark').classList.toggle('active', act === 'view-benchmark');
+        }
+      });
+      renderRun(0);
+    })();
+  </script>
+</body>
+</html>

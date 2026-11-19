@@ -1,0 +1,21 @@
+{
+  "name": "skill-foundry",
+  "version": "0.1.0",
+  "description": "Engineering workbench for Agent Skills: scaffold, validate, package, run cross-CLI trigger evals, optimize descriptions, lint token budgets, vet security risks, and audit Claude/Codex token cost.",
+  "author": {
+    "name": "AI-Infrastructure Contributors"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/Alex-Caepio/skill-foundry",
+  "repository": "https://github.com/Alex-Caepio/skill-foundry",
+  "keywords": [
+    "skills",
+    "validation",
+    "evaluation",
+    "optimization",
+    "token-budget",
+    "security-vetting",
+    "cost-audit"
+  ],
+  "mcpServers": "./.mcp.json"
+}

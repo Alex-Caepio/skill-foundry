@@ -1,0 +1,22 @@
+pub mod benchmark;
+pub mod budget;
+pub mod cancel;
+pub mod common;
+pub mod cost;
+pub mod error;
+pub mod evaluation;
+pub mod mcp;
+pub mod ooxml;
+pub mod optimization;
+pub mod platform_cli;
+pub mod reports;
+pub mod review;
+pub mod rng;
+pub mod runner;
+pub mod scaffold;
+pub mod utils;
+pub mod validation;
+pub mod vetting;
+pub mod workbook_preview;
+
+pub use error::{ErrorKind, Result, RuntimeError};

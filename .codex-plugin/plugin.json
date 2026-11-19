@@ -1,0 +1,43 @@
+{
+  "name": "skill-foundry",
+  "version": "0.1.0",
+  "description": "Engineering workbench for Agent Skills: scaffold, validate, package, run cross-CLI trigger evals, optimize descriptions, lint token budgets, vet security risks, and audit Claude/Codex token cost.",
+  "author": {
+    "name": "AI-Infrastructure Contributors"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/Alex-Caepio/skill-foundry",
+  "repository": "https://github.com/Alex-Caepio/skill-foundry",
+  "keywords": [
+    "skills",
+    "validation",
+    "evaluation",
+    "optimization",
+    "token-budget",
+    "security-vetting",
+    "cost-audit"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.codex-mcp.json",
+  "interface": {
+    "displayName": "Skill Foundry",
+    "shortDescription": "Build, test, vet, and budget-check Agent Skills",
+    "longDescription": "Standalone Rust engineering workbench for Agent Skills across Claude Code and Codex: scaffold SKILL.md bundles, validate frontmatter and local links, measure token budgets, run cross-CLI trigger evaluations and description optimization loops, vet third-party skills against 8+4 security gates, and audit BTE token spend.",
+    "developerName": "AI-Infrastructure Contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Validate and check the token budget of the skills in this repository",
+      "Vet a skill directory against the 8 binary security gates",
+      "Audit recent Claude and Codex BTE token spend by skill and MCP tool"
+    ],
+    "brandColor": "#D97757",
+    "composerIcon": "./assets/logo.svg",
+    "logo": "./assets/logo.svg",
+    "screenshots": []
+  }
+}
