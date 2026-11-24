@@ -154,6 +154,83 @@ pub fn improvement_prompt(
     prompt
 }
 
+const DEFAULT_MIN_MARGINAL_ROI: f64 = 0.01;
+const DEFAULT_ROI_PATIENCE: usize = 2;
+
+pub fn gate1_candidate_issue(name: &str, description: &str) -> Option<String> {
+    let count = description.chars().count();
+    let prefilter_err = evaluation::static_prefilter_description(name, description).err();
+    match (count > 1024, prefilter_err) {
+        (false, None) => None,
+        (true, None) => Some(format!(
+            "at {count} characters is over the 1024-character hard limit"
+        )),
+        (false, Some(err)) => Some(format!("failed Gate-1 static prefilter ({err})")),
+        (true, Some(err)) => Some(format!(
+            "at {count} characters is over the 1024-character hard limit and failed Gate-1 static prefilter ({err})"
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OptimizationRoiTracker {
+    min_marginal_roi: f64,
+    roi_patience: usize,
+    baseline_seen: bool,
+    best_rate: f64,
+    stalled_rounds: usize,
+}
+
+impl OptimizationRoiTracker {
+    pub fn new(min_marginal_roi: f64, roi_patience: usize) -> Self {
+        Self {
+            min_marginal_roi: min_marginal_roi.max(0.0),
+            roi_patience: roi_patience.max(1),
+            baseline_seen: false,
+            best_rate: 0.0,
+            stalled_rounds: 0,
+        }
+    }
+
+    pub fn observe_round(&mut self, iteration: usize, passed: u64, total: u64) -> Option<String> {
+        let rate = if total == 0 {
+            0.0
+        } else {
+            passed as f64 / total as f64
+        };
+        if !self.baseline_seen {
+            self.baseline_seen = true;
+            self.best_rate = rate;
+            self.stalled_rounds = 0;
+            return None;
+        }
+        if rate - self.best_rate > self.min_marginal_roi {
+            self.best_rate = rate;
+            self.stalled_rounds = 0;
+            None
+        } else {
+            self.stalled_rounds += 1;
+            if self.stalled_rounds >= self.roi_patience {
+                Some(format!(
+                    "marginal_roi_early_stop (iteration {iteration}, best_pass_rate={:.3}, stalled={})",
+                    self.best_rate, self.stalled_rounds
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub fn candidate_already_evaluated(history: &[Value], candidate: &str) -> bool {
+    let needle = candidate.trim();
+    history.iter().any(|entry| {
+        entry["description"]
+            .as_str()
+            .is_some_and(|prior| prior.trim() == needle)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn improve_description(
     config: &platform_cli::PlatformConfig,
@@ -167,25 +244,39 @@ pub fn improve_description(
     log_dir: Option<&Path>,
     iteration: Option<usize>,
 ) -> Result<String> {
+    evaluation::static_prefilter_description(name, current)?;
     let prompt = improvement_prompt(config, name, content, current, eval, history, test);
     let response = platform_cli::call_model(config, &prompt, model, Duration::from_secs(300))?;
     let mut description = parse_description(&response);
     let count = description.chars().count();
+    let gate_issue = gate1_candidate_issue(name, &description);
     let mut transcript = json!({
         "iteration": iteration,
         "prompt": prompt,
         "response": response,
         "parsed_description": description,
         "char_count": count,
-        "over_limit": count > 1024
+        "over_limit": count > 1024,
+        "gate1_issue": gate_issue
     });
-    if count > 1024 {
+    // One explicit repair/shortening attempt is part of the closed-loop Gate-1 protocol, not a blind retry.
+    if let Some(issue) = gate_issue {
         let shorten = format!(
-            "{prompt}\n\n---\n\nA previous attempt produced {count} characters (> 1024 limit):\n\n\"{description}\"\n\nRewrite it under 1024 characters preserving key intent coverage in <new_description> tags."
+            "{prompt}\n\n---\n\nA previous attempt produced this description, which {issue}:\n\n\"{description}\"\n\nRewrite it to be a clean, non-empty, secret-free description strictly under 1024 characters keeping the most important trigger words and intent coverage. Respond with only the new description in <new_description> tags."
         );
         let response = platform_cli::call_model(config, &shorten, model, Duration::from_secs(300))?;
-        description = parse_description(&response);
-        transcript["rewrite_description"] = json!(description);
+        let candidate = parse_description(&response);
+        let rewrite_issue = gate1_candidate_issue(name, &candidate);
+        transcript["rewrite_prompt"] = json!(shorten);
+        transcript["rewrite_response"] = json!(response);
+        transcript["rewrite_description"] = json!(candidate);
+        transcript["rewrite_gate1_issue"] = json!(rewrite_issue);
+        if let Some(err) = rewrite_issue {
+            return Err(RuntimeError::invalid(format!(
+                "Rewritten description still rejected by Gate-1 prefilter: {err}"
+            )));
+        }
+        description = candidate;
     }
     transcript["final_description"] = json!(description);
     if let Some(path) = log_dir {
@@ -324,6 +415,10 @@ pub fn loop_execute(v: &Value) -> Result<Value> {
         .filter(|s| !s.is_empty())
         .unwrap_or(&skill.description)
         .to_owned();
+    evaluation::static_prefilter(&skill.name, &current, eval)?;
+    let min_marginal_roi = common::number(v, "min_marginal_roi", DEFAULT_MIN_MARGINAL_ROI)?;
+    let roi_patience = common::positive(v, "roi_patience", DEFAULT_ROI_PATIENCE)?;
+    let mut roi_tracker = OptimizationRoiTracker::new(min_marginal_roi, roi_patience);
     let mut history = vec![];
     let mut log = String::new();
     let verbose = common::flag(v, "verbose");
@@ -406,6 +501,15 @@ pub fn loop_execute(v: &Value) -> Result<Value> {
             reason = format!("max_iterations ({iterations})");
             break;
         }
+        let train_passed = train_summary["passed"].as_u64().unwrap_or(0);
+        let train_total = train_summary["total"].as_u64().unwrap_or(0);
+        if let Some(early_stop_reason) = roi_tracker.observe_round(iteration, train_passed, train_total) {
+            if verbose {
+                log.push_str(&format!("\nEarly stop: {early_stop_reason}\n"));
+            }
+            reason = early_stop_reason;
+            break;
+        }
         let blind: Vec<Value> = history
             .iter()
             .map(|h| {
@@ -419,7 +523,7 @@ pub fn loop_execute(v: &Value) -> Result<Value> {
                 )
             })
             .collect();
-        current = improve_description(
+        let next = improve_description(
             &options.config,
             &skill.name,
             &skill.content,
@@ -431,6 +535,16 @@ pub fn loop_execute(v: &Value) -> Result<Value> {
             logs.as_deref(),
             Some(iteration),
         )?;
+        if candidate_already_evaluated(&history, &next) {
+            if verbose {
+                log.push_str(&format!(
+                    "\nEarly stop: candidate description already evaluated at iteration {iteration}\n"
+                ));
+            }
+            reason = format!("converged_duplicate_description (iteration {iteration})");
+            break;
+        }
+        current = next;
     }
 
     let result = loop_output(

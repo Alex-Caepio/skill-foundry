@@ -11,6 +11,7 @@ pub mod optimization;
 pub mod platform_cli;
 pub mod reports;
 pub mod review;
+pub mod review_feedback;
 pub mod rng;
 pub mod runner;
 pub mod scaffold;

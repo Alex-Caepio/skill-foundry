@@ -50,6 +50,8 @@ COMMANDS:
 
 GLOBAL OPTIONS:
   --json       Force JSON output on stdout
+  --no-cache   Bypass settled memo/receipt caches
+  --strict     Enforce strict validation/risk checks and bypass caches
   -h, --help   Show this help message
   -V, --version Show version
 "
@@ -73,7 +75,7 @@ fn parse_args(args: &[String]) -> Result<(Map<String, Value>, Vec<String>, bool)
                 None => (flag, None),
             };
             let key = raw_key.replace('-', "_");
-            let bool_flags = ["dry_run", "verbose", "auto_refresh", "no_browser", "strict"];
+            let bool_flags = ["dry_run", "verbose", "auto_refresh", "no_browser", "strict", "no_cache"];
             if bool_flags.contains(&key.as_str()) && inline_val.is_none() {
                 map.insert(key, json!(true));
                 i += 1;

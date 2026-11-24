@@ -1,10 +1,15 @@
 use crate::{Result, RuntimeError};
+use regex::Regex;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tempfile::{Builder, NamedTempFile, TempDir};
 
@@ -193,6 +198,135 @@ pub fn json_cli(result: Value, stderr: String) -> Result<Value> {
 
 pub fn rounded(n: f64) -> f64 {
     format!("{n:.4}").parse().unwrap_or(n)
+}
+
+pub fn sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+pub const RACY_FS_NS: i128 = 2_000_000_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileStatStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub mtime_ns: i128,
+    pub ctime_ns: i128,
+    pub mode: u32,
+    pub nlink: u64,
+}
+
+impl FileStatStamp {
+    pub fn from_metadata(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mtime_ns = (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128);
+            let ctime_ns = (meta.ctime() as i128) * 1_000_000_000 + (meta.ctime_nsec() as i128);
+            Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                len: meta.len(),
+                mtime_ns,
+                ctime_ns,
+                mode: meta.mode(),
+                nlink: meta.nlink(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i128)
+                .unwrap_or(0);
+            Self {
+                dev: 0,
+                ino: 0,
+                len: meta.len(),
+                mtime_ns,
+                ctime_ns: mtime_ns,
+                mode: if meta.is_dir() { 0o40755 } else { 0o100644 },
+                nlink: 1,
+            }
+        }
+    }
+
+    pub fn is_settled(&self, now_ns: i128) -> bool {
+        self.mtime_ns > 0
+            && self.ctime_ns > 0
+            && now_ns >= self.mtime_ns + RACY_FS_NS
+            && now_ns >= self.ctime_ns + RACY_FS_NS
+    }
+
+    pub fn same_file_identity(&self, other: &Self) -> bool {
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.len == other.len
+            && self.mtime_ns == other.mtime_ns
+            && self.ctime_ns == other.ctime_ns
+            && self.mode == other.mode
+    }
+}
+
+pub fn now_unix_ns() -> i128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
+pub fn is_cache_bypassed() -> bool {
+    std::env::var("SKILL_FOUNDRY_NO_CACHE").as_deref() == Ok("1")
+        || std::env::var("INFRA_CHECK_NO_CACHE").as_deref() == Ok("1")
+        || std::env::var("INFRA_NO_CACHE").as_deref() == Ok("1")
+        || std::env::var("INFRA_TOOLING_NO_CACHE").as_deref() == Ok("1")
+}
+
+/// Detect common hardcoded secret/credential patterns before passing text to external probes or logs.
+pub fn detect_sensitive_label(text: &str) -> Option<&'static str> {
+    static PATTERNS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    let list = PATTERNS.get_or_init(|| {
+        [
+            (
+                "private key",
+                r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----",
+            ),
+            (
+                "GitHub token",
+                r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+            ),
+            ("GitLab token", r"\bglpat-[A-Za-z0-9\-_]{20,}\b"),
+            ("Slack token", r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),
+            (
+                "AWS access key",
+                r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+            ),
+            ("Google API key", r"\bAIza[0-9A-Za-z\-_]{35}\b"),
+            (
+                "OpenAI-style token",
+                r"\bsk-(?:ant-|proj-|svcacct-)?[A-Za-z0-9\-_]{20,}\b",
+            ),
+            ("Stripe secret key", r"\b[rs]k_(?:live|test)_[0-9A-Za-z]{16,}\b"),
+            ("npm token", r"\bnpm_[A-Za-z0-9]{20,}\b"),
+            ("PyPI token", r"\bpypi-[A-Za-z0-9\-_]{20,}\b"),
+            ("Hugging Face token", r"\bhf_[A-Za-z0-9]{20,}\b"),
+            ("credential in URL", r"https?://[^/\s:@]+:[^/\s@]+@"),
+            ("bearer token", r"(?i)\bBearer\s+[A-Za-z0-9\-_.~+/]{20,}=*"),
+        ]
+        .into_iter()
+        .map(|(label, pat)| (label, Regex::new(pat).expect("valid sensitivity regex")))
+        .collect()
+    });
+    list.iter()
+        .find_map(|(label, re)| re.is_match(text).then_some(*label))
 }
 
 pub fn env() -> BTreeMap<String, String> {

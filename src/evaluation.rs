@@ -4,13 +4,383 @@ use crate::{
     platform_cli::{self, PlatformConfig},
     runner, utils, validation,
 };
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
-    path::Path,
-    sync::{Arc, Mutex, mpsc},
+    collections::{BTreeMap, HashMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     time::Duration,
 };
+
+const MAX_DESCRIPTION_CHARS: usize = 4096;
+const MAX_QUERY_MEMO_ENTRIES: usize = 4096;
+const MAX_TREE_DIGEST_FILES: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct QueryMemoKey {
+    platform: String,
+    skill_name: String,
+    tree_digest: String,
+    timeout_ms: u64,
+    description_sha256: String,
+    query_sha256: String,
+    model: String,
+    sample_index: usize,
+}
+
+impl QueryMemoKey {
+    fn digest_hex(&self) -> String {
+        let payload = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.platform,
+            self.skill_name,
+            self.tree_digest,
+            self.timeout_ms,
+            self.description_sha256,
+            self.query_sha256,
+            self.model,
+            self.sample_index
+        );
+        common::sha256(payload.as_bytes())
+    }
+}
+
+#[derive(Default)]
+pub struct QueryMemoCache {
+    entries: HashMap<QueryMemoKey, bool>,
+    order: VecDeque<QueryMemoKey>,
+    pub hits: u64,
+    pub misses: u64,
+    conn: Option<Connection>,
+}
+
+impl QueryMemoCache {
+    pub fn open(path: &Path) -> std::result::Result<Self, rusqlite::Error> {
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(err)));
+        }
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS query_memo (
+                memo_key TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                skill_name TEXT NOT NULL,
+                tree_digest TEXT NOT NULL,
+                timeout_ms INTEGER NOT NULL,
+                description_sha256 TEXT NOT NULL,
+                query_sha256 TEXT NOT NULL,
+                model TEXT NOT NULL,
+                sample_index INTEGER NOT NULL,
+                result INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_query_memo_updated ON query_memo(updated_at);",
+        )?;
+        Ok(Self {
+            conn: Some(conn),
+            ..Self::default()
+        })
+    }
+
+    pub fn open_best_effort(path: &Path) -> Self {
+        Self::open(path).unwrap_or_default()
+    }
+
+    fn db_get(conn: &Connection, memo_key: &str) -> Option<bool> {
+        let row: Option<i64> = conn
+            .query_row(
+                "SELECT result FROM query_memo WHERE memo_key = ?1",
+                params![memo_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if row.is_some() {
+            let now = i64::try_from(common::now_unix_ns()).unwrap_or(i64::MAX);
+            let _ = conn.execute(
+                "UPDATE query_memo SET updated_at = ?2 WHERE memo_key = ?1",
+                params![memo_key, now],
+            );
+        }
+        row.map(|value| value != 0)
+    }
+
+    fn db_put(conn: &Connection, key: &QueryMemoKey, result: bool) {
+        let memo_key = key.digest_hex();
+        let timeout_ms = i64::try_from(key.timeout_ms).unwrap_or(i64::MAX);
+        let sample_index = i64::try_from(key.sample_index).unwrap_or(i64::MAX);
+        let stored = i64::from(result);
+        let now = i64::try_from(common::now_unix_ns()).unwrap_or(i64::MAX);
+        if conn
+            .execute(
+                "INSERT OR REPLACE INTO query_memo (
+                    memo_key, platform, skill_name, tree_digest, timeout_ms,
+                    description_sha256, query_sha256, model, sample_index, result, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    memo_key,
+                    key.platform,
+                    key.skill_name,
+                    key.tree_digest,
+                    timeout_ms,
+                    key.description_sha256,
+                    key.query_sha256,
+                    key.model,
+                    sample_index,
+                    stored,
+                    now,
+                ],
+            )
+            .is_ok()
+        {
+            let _ = conn.execute(
+                "DELETE FROM query_memo
+                 WHERE memo_key IN (
+                     SELECT memo_key FROM query_memo
+                     ORDER BY updated_at DESC, rowid DESC
+                     LIMIT -1 OFFSET ?1
+                 )",
+                params![i64::try_from(MAX_QUERY_MEMO_ENTRIES).unwrap_or(i64::MAX)],
+            );
+        }
+    }
+
+    fn remember_l1(&mut self, key: QueryMemoKey, result: bool) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.entries.entry(key.clone())
+        {
+            entry.insert(result);
+            return;
+        }
+        if self.entries.len() >= MAX_QUERY_MEMO_ENTRIES
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.entries.remove(&evicted);
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, result);
+    }
+
+    pub fn get(&mut self, key: &QueryMemoKey) -> Option<bool> {
+        if let Some(&hit) = self.entries.get(key) {
+            self.hits += 1;
+            return Some(hit);
+        }
+        let db_hit = self
+            .conn
+            .as_ref()
+            .and_then(|conn| Self::db_get(conn, &key.digest_hex()));
+        if let Some(hit) = db_hit {
+            self.hits += 1;
+            self.remember_l1(key.clone(), hit);
+            return Some(hit);
+        }
+        None
+    }
+
+    pub fn insert(&mut self, key: QueryMemoKey, result: bool) {
+        self.misses += 1;
+        if let Some(conn) = &self.conn {
+            Self::db_put(conn, &key, result);
+        }
+        self.remember_l1(key, result);
+    }
+}
+
+fn default_memo_db_path() -> PathBuf {
+    for env_name in ["SKILL_FOUNDRY_MEMO_DB", "INFRA_SKILL_TOOLS_MEMO_DB"] {
+        if let Some(custom) = std::env::var_os(env_name)
+            && !custom.is_empty()
+        {
+            return PathBuf::from(custom);
+        }
+    }
+    #[cfg(test)]
+    {
+        static TEST_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let dir = TEST_DIR.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("skill-foundry-memo-")
+                .tempdir()
+                .expect("create test memo tempdir")
+        });
+        dir.path().join("query-memo.sqlite3")
+    }
+    #[cfg(not(test))]
+    {
+        let base = std::env::var_os("XDG_CACHE_HOME")
+            .filter(|val| !val.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|val| !val.is_empty())
+                    .map(|home| PathBuf::from(home).join(".cache"))
+            })
+            .unwrap_or_else(std::env::temp_dir);
+        base.join("skill-foundry").join("query-memo.sqlite3")
+    }
+}
+
+fn query_memo() -> &'static Mutex<QueryMemoCache> {
+    static MEMO: OnceLock<Mutex<QueryMemoCache>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(QueryMemoCache::open_best_effort(&default_memo_db_path())))
+}
+
+fn is_transient_probe_file(file_name: &str, skill_name: &str) -> bool {
+    let prefix = format!("{skill_name}-skill-");
+    file_name
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn collect_tree_digests(
+    base: &Path,
+    dir: &Path,
+    skill_name: &str,
+    records: &mut Vec<(String, String)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    children.sort();
+    for path in children {
+        if records.len() >= MAX_TREE_DIGEST_FILES {
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+        if meta.is_dir() {
+            if matches!(name, ".git" | "node_modules" | "target" | "vendor") {
+                continue;
+            }
+            collect_tree_digests(base, &path, skill_name, records);
+        } else if meta.is_file() {
+            if is_transient_probe_file(name, skill_name) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            records.push((rel, common::sha256(&bytes)));
+        }
+    }
+}
+
+pub fn skill_tree_digest(project: &Path, skills_path: Option<&str>, skill_name: &str) -> String {
+    let canonical = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    let mut records: Vec<(String, String)> = Vec::new();
+    if let Some(rel) = skills_path
+        && !rel.is_empty()
+    {
+        let skills_dir = canonical.join(rel);
+        if skills_dir.is_dir() {
+            collect_tree_digests(&canonical, &skills_dir, skill_name, &mut records);
+        }
+    }
+    for root_file in ["SKILL.md", "AGENTS.md", "CLAUDE.md"] {
+        if records.len() >= MAX_TREE_DIGEST_FILES {
+            break;
+        }
+        let path = canonical.join(root_file);
+        if path.is_file()
+            && let Ok(bytes) = std::fs::read(&path)
+        {
+            records.push((root_file.to_string(), common::sha256(&bytes)));
+        }
+    }
+    records.sort();
+    let mut buf = String::new();
+    buf.push_str(&canonical.to_string_lossy());
+    buf.push('\n');
+    for (rel, digest) in records {
+        buf.push_str(&rel);
+        buf.push(':');
+        buf.push_str(&digest);
+        buf.push('\n');
+    }
+    common::sha256(buf.as_bytes())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn query_memo_key_with_digest(
+    platform: &str,
+    skill_name: &str,
+    tree_digest: &str,
+    timeout: Duration,
+    description: &str,
+    query: &str,
+    model: Option<&str>,
+    sample_index: usize,
+) -> QueryMemoKey {
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    QueryMemoKey {
+        platform: platform.to_string(),
+        skill_name: skill_name.to_string(),
+        tree_digest: tree_digest.to_string(),
+        timeout_ms,
+        description_sha256: common::sha256(description.as_bytes()),
+        query_sha256: common::sha256(query.as_bytes()),
+        model: model.unwrap_or("").to_string(),
+        sample_index,
+    }
+}
+
+/// Static Gate-1 pre-filter applied before probe execution or optimization rounds.
+pub fn static_prefilter_description(name: &str, description: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(RuntimeError::invalid("Skill name must not be empty"));
+    }
+    let trimmed = description.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::invalid("Skill description must not be empty"));
+    }
+    if description.chars().count() > MAX_DESCRIPTION_CHARS {
+        return Err(RuntimeError::invalid(format!(
+            "Skill description exceeds {MAX_DESCRIPTION_CHARS} characters"
+        )));
+    }
+    if let Some(label) = common::detect_sensitive_label(description) {
+        return Err(RuntimeError::invalid(format!(
+            "Skill description contains sensitive content ({label})"
+        )));
+    }
+    Ok(())
+}
+
+/// Static pre-filter validating both the candidate description and evaluation queries.
+pub fn static_prefilter(name: &str, description: &str, eval_set: &[Value]) -> Result<()> {
+    static_prefilter_description(name, description)?;
+    for item in eval_set {
+        let Some(query) = item["query"].as_str() else {
+            continue;
+        };
+        if let Some(label) = common::detect_sensitive_label(query) {
+            return Err(RuntimeError::invalid(format!(
+                "Eval query contains sensitive content ({label})"
+            )));
+        }
+    }
+    Ok(())
+}
 
 struct ProbeFile(std::path::PathBuf);
 impl Drop for ProbeFile {
@@ -92,8 +462,65 @@ impl TriggerDetector {
     }
 }
 
+pub fn run_single_query_with_memo_in(
+    cache: &Mutex<QueryMemoCache>,
+    key: QueryMemoKey,
+    name: &str,
+    description: &str,
+    exec: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    static_prefilter_description(name, description)?;
+    if let Ok(mut guard) = cache.lock()
+        && let Some(hit) = guard.get(&key)
+    {
+        return Ok(hit);
+    }
+    let result = exec()?;
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, result);
+    }
+    Ok(result)
+}
+
+fn run_single_query_with_memo(
+    key: QueryMemoKey,
+    name: &str,
+    description: &str,
+    exec: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    if common::is_cache_bypassed() {
+        static_prefilter_description(name, description)?;
+        return exec();
+    }
+    run_single_query_with_memo_in(query_memo(), key, name, description, exec)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_single_query(
+    config: &PlatformConfig,
+    query: &str,
+    name: &str,
+    description: &str,
+    timeout: Duration,
+    project: &Path,
+    model: Option<&str>,
+    environment: &BTreeMap<String, String>,
+) -> Result<bool> {
+    static_prefilter_description(name, description)?;
+    execute_single_query(
+        config,
+        query,
+        name,
+        description,
+        timeout,
+        project,
+        model,
+        environment,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_single_query(
     config: &PlatformConfig,
     query: &str,
     name: &str,
@@ -324,42 +751,63 @@ pub fn run_eval(
     options: &EvalOptions,
     log: &mut String,
 ) -> Result<Value> {
+    static_prefilter(name, description, eval_set)?;
     let jobs = prepare_jobs(eval_set, options)?;
+    let mut sample_counts: HashMap<&str, usize> = HashMap::new();
     let mut queue = VecDeque::with_capacity(jobs.job_count);
-    for index in 0..eval_set.len() {
-        queue.extend(std::iter::repeat_n(index, options.runs));
+    for (index, item) in eval_set.iter().enumerate() {
+        let query = item["query"].as_str().expect("validated evaluation query");
+        let sample = sample_counts.entry(query).or_default();
+        for _ in 0..options.runs {
+            queue.push_back((index, *sample));
+            *sample += 1;
+        }
     }
     let queue = Arc::new(Mutex::new(queue));
     let (tx, rx) = mpsc::channel();
     let environment = common::env();
+    let tree_digest = skill_tree_digest(project, Some(options.config.skills_path), name);
     let mut completed = vec![];
     std::thread::scope(|scope| {
         for _ in 0..options.workers.min(128) {
             let queue = queue.clone();
             let tx = tx.clone();
             let environment = environment.clone();
+            let tree_digest = tree_digest.clone();
             scope.spawn(move || {
                 loop {
                     if cancel::interrupted() {
                         break;
                     }
                     let job = queue.lock().unwrap().pop_front();
-                    let Some(index) = job else {
+                    let Some((index, sample_index)) = job else {
                         break;
                     };
                     let query = eval_set[index]["query"]
                         .as_str()
                         .expect("validated evaluation query");
-                    let result = run_single_query(
-                        &options.config,
-                        query,
+                    let key = query_memo_key_with_digest(
+                        options.config.key,
                         name,
-                        description,
+                        &tree_digest,
                         options.timeout,
-                        project,
+                        description,
+                        query,
                         options.model.as_deref(),
-                        &environment,
+                        sample_index,
                     );
+                    let result = run_single_query_with_memo(key, name, description, || {
+                        execute_single_query(
+                            &options.config,
+                            query,
+                            name,
+                            description,
+                            options.timeout,
+                            project,
+                            options.model.as_deref(),
+                            &environment,
+                        )
+                    });
                     if tx.send((index, result)).is_err() {
                         break;
                     }

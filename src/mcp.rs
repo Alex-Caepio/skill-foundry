@@ -146,9 +146,11 @@ fn ensure_explicit_path_outside_plugin_cwd(args: &Value, field: &str) -> Result<
             cwd.display()
         ))),
         Some(p) if !std::path::Path::new(p).is_absolute() => {
-            // Check relative subpaths don't just stay at plugin root '.' via './.'
-            let joined = cwd.join(p);
-            if joined == cwd {
+            let rel = std::path::Path::new(p);
+            let only_cur_dir = rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::CurDir));
+            if only_cur_dir || cwd.join(rel) == cwd {
                 Err(RuntimeError::invalid(format!(
                     "MCP server cwd is a plugin directory ({}); pass an explicit '{field}' path",
                     cwd.display()

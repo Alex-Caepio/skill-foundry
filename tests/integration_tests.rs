@@ -260,6 +260,7 @@ fn binary_mcp_refuses_omitted_or_dot_path_from_plugin_cwd_with_ancestor_markers(
             r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#, "\n",
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"skill_vet","arguments":{{}}}}}}"#, "\n",
             r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"skill_validate","arguments":{{"path":"."}}}}}}"#, "\n",
+            r#"{{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{{"name":"skill_validate","arguments":{{"path":"./."}}}}}}"#, "\n",
             r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"skill_scaffold","arguments":{{"name":"bad","path":"."}}}}}}"#, "\n",
             r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"skill_budget_check","arguments":{{}}}}}}"#, "\n",
             r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"skill_package","arguments":{{"skill_path":"{0}"}}}}}}"#, "\n",
@@ -272,14 +273,272 @@ fn binary_mcp_refuses_omitted_or_dot_path_from_plugin_cwd_with_ancestor_markers(
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<serde_json::Value> = stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(lines.len(), 7);
+    assert_eq!(lines.len(), 8);
     assert_eq!(lines[1]["result"]["isError"], true);
     assert_eq!(lines[2]["result"]["isError"], true);
     assert_eq!(lines[3]["result"]["isError"], true);
     assert_eq!(lines[4]["result"]["isError"], true);
     assert_eq!(lines[5]["result"]["isError"], true);
-    assert_eq!(lines[6]["id"], 7);
-    assert_eq!(lines[6]["result"]["isError"], false);
-    assert_eq!(lines[6]["result"]["structuredContent"]["valid"], true);
+    assert_eq!(lines[6]["result"]["isError"], true);
+    assert_eq!(lines[7]["id"], 7);
+    assert_eq!(lines[7]["result"]["isError"], false);
+    assert_eq!(lines[7]["result"]["structuredContent"]["valid"], true);
     assert!(mcp::call_tool("skill_budget_check", &json!({})).is_err());
+}
+
+#[test]
+fn evaluation_query_memo_cache_persists_in_sqlite_and_prefilter_blocks_secrets() {
+    use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".claude/commands")).unwrap();
+    let skill_file = project.join(".claude/commands/alpha.md");
+    std::fs::write(&skill_file, "---\ndescription: alpha\n---\n").unwrap();
+
+    // Transient probe files must NOT perturb skill_tree_digest
+    let d1 = evaluation::skill_tree_digest(&project, Some(".claude/commands"), "alpha");
+    std::fs::write(project.join(".claude/commands/alpha-skill-deadbeef.md"), "probe").unwrap();
+    let d2 = evaluation::skill_tree_digest(&project, Some(".claude/commands"), "alpha");
+    assert_eq!(d1, d2);
+
+    // Real edit DOES perturb skill_tree_digest
+    std::fs::write(&skill_file, "---\ndescription: alpha updated\n---\n").unwrap();
+    let d3 = evaluation::skill_tree_digest(&project, Some(".claude/commands"), "alpha");
+    assert_ne!(d1, d3);
+
+    // SQLite WAL memo cache persists across reopen and distinguishes sample_index
+    let db_path = tmp.path().join("memo/query_memo.sqlite");
+    let calls = AtomicUsize::new(0);
+    {
+        let cache = Mutex::new(evaluation::QueryMemoCache::open(&db_path).unwrap());
+        let k0 = evaluation::query_memo_key_with_digest(
+            "claude",
+            "alpha",
+            &d3,
+            Duration::from_secs(30),
+            "Safe trigger description",
+            "run demo task",
+            None,
+            0,
+        );
+        let k1 = evaluation::query_memo_key_with_digest(
+            "claude",
+            "alpha",
+            &d3,
+            Duration::from_secs(30),
+            "Safe trigger description",
+            "run demo task",
+            None,
+            1,
+        );
+        let v0 = evaluation::run_single_query_with_memo_in(&cache, k0.clone(), "alpha", "Safe trigger description", || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        })
+        .unwrap();
+        assert!(v0);
+        let v0_hit = evaluation::run_single_query_with_memo_in(&cache, k0, "alpha", "Safe trigger description", || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(false)
+        })
+        .unwrap();
+        assert!(v0_hit);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let v1 = evaluation::run_single_query_with_memo_in(&cache, k1, "alpha", "Safe trigger description", || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(false)
+        })
+        .unwrap();
+        assert!(!v1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    // Reopen SQLite file from disk — L1 is empty, L2 SQLite must serve the hit!
+    let reopened = Mutex::new(evaluation::QueryMemoCache::open(&db_path).unwrap());
+    let k0_again = evaluation::query_memo_key_with_digest(
+        "claude",
+        "alpha",
+        &d3,
+        Duration::from_secs(30),
+        "Safe trigger description",
+        "run demo task",
+        None,
+        0,
+    );
+    let persisted = evaluation::run_single_query_with_memo_in(
+        &reopened,
+        k0_again,
+        "alpha",
+        "Safe trigger description",
+        || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(false)
+        },
+    )
+    .unwrap();
+    assert!(persisted);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    // Gate-1 static_prefilter blocks secrets in description or queries
+    let leaked_tok = format!("{}{}", "ghp_", "0123456789abcdefghij12345");
+    assert!(evaluation::static_prefilter_description("alpha", &leaked_tok).is_err());
+    assert!(
+        evaluation::static_prefilter(
+            "alpha",
+            "Safe trigger description",
+            &[json!({"query": format!("use {leaked_tok}"), "should_trigger": true})]
+        )
+        .is_err()
+    );
+    assert!(evaluation::static_prefilter_description("alpha", "").is_err());
+}
+
+#[test]
+fn optimization_gate1_prefilter_roi_tracker_and_duplicate_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let skill_dir = tmp.path().join("bad-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let secret = format!("{}{}", "ghp_", "abcdefghijklmnopqrstuvwx");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: bad-skill\ndescription: Leak {secret}\n---\n\n# Bad\n"),
+    )
+    .unwrap();
+    let eval_path = tmp.path().join("eval.json");
+    std::fs::write(
+        &eval_path,
+        serde_json::to_string(&[
+            json!({"query": "p1", "should_trigger": true}),
+            json!({"query": "p2", "should_trigger": true}),
+            json!({"query": "n1", "should_trigger": false}),
+            json!({"query": "n2", "should_trigger": false}),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let results_dir = tmp.path().join("results-never-created");
+    let res = optimization::loop_execute(&json!({
+        "skill_path": skill_dir,
+        "eval_set": eval_path,
+        "platform": "codex",
+        "results_dir": results_dir,
+    }));
+    assert!(res.is_err());
+    assert!(!results_dir.exists(), "Gate-1 failure must happen before results_dir creation");
+
+    assert!(optimization::gate1_candidate_issue("alpha", &"x".repeat(1025)).is_some());
+    assert!(optimization::gate1_candidate_issue("alpha", "").is_some());
+    assert!(optimization::gate1_candidate_issue("alpha", "Use when auditing logs.").is_none());
+
+    let mut roi = optimization::OptimizationRoiTracker::new(0.05, 2);
+    assert!(roi.observe_round(1, 5, 10).is_none());
+    assert!(roi.observe_round(2, 5, 10).is_none());
+    let stopped = roi.observe_round(3, 5, 10).expect("must early stop on stalled ROI");
+    assert!(stopped.contains("marginal_roi_early_stop"));
+
+    let history = vec![json!({"description": "  Trigger on PHP migrations.  "})];
+    assert!(optimization::candidate_already_evaluated(&history, "Trigger on PHP migrations."));
+    assert!(!optimization::candidate_already_evaluated(&history, "Trigger on Composer locks."));
+}
+
+#[test]
+fn benchmark_extended_skillcache_metrics_and_hardened_review_html() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("bench-ws");
+    for (cfg, pass, dur, tok, calls, deopt, price, comp, be) in [
+        ("cold", 0.5, 4.0, 2000.0, 5.0, None, Some(0.04), None, None),
+        ("warm_a", 1.0, 1.5, 800.0, 2.0, Some(0.1), Some(0.015), Some(0.05), Some(2)),
+        ("warm_b", 0.9, 2.0, 1000.0, 3.0, Some(0.2), Some(0.02), Some(0.03), Some(3)),
+    ] {
+        let run_dir = ws.join(format!("runs/eval-1/{cfg}/run-1"));
+        std::fs::create_dir_all(run_dir.join("outputs")).unwrap();
+        std::fs::write(run_dir.join("outputs/summary.txt"), format!("{cfg} output")).unwrap();
+        std::fs::write(
+            run_dir.join("grading.json"),
+            serde_json::to_string(&json!({
+                "summary": {"pass_rate": pass, "passed": 1, "failed": 0, "total": 1},
+                "execution_metrics": {"total_tool_calls": 2, "errors_encountered": 0},
+                "timing": {"total_duration_seconds": dur, "total_tokens": tok}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut metrics = serde_json::Map::new();
+        metrics.insert("model_calls".into(), json!(calls));
+        if let Some(d) = deopt {
+            metrics.insert("deopt_rate".into(), json!(d));
+        }
+        if let Some(p) = price {
+            metrics.insert("list_price_usd".into(), json!(p));
+        }
+        if let Some(c) = comp {
+            metrics.insert("compile_usd".into(), json!(c));
+        }
+        if let Some(b) = be {
+            metrics.insert("breakeven_reuses".into(), json!(b));
+        }
+        std::fs::write(run_dir.join("metrics.json"), serde_json::to_string(&metrics).unwrap()).unwrap();
+    }
+
+    let mut log = String::new();
+    let bench = benchmark::generate_benchmark_with_options(
+        &ws,
+        "demo-cache",
+        "skills/demo",
+        &mut log,
+        0,
+        true,
+    )
+    .unwrap();
+    assert_eq!(bench["configuration_order"], json!(["cold", "warm_a", "warm_b"]));
+    assert!(bench["run_summary"]["deltas"]["warm_a"]["model_calls"].is_string());
+    assert!(bench["run_summary"]["warm_a"]["deopt_rate"]["mean"] == 0.1);
+    assert!(bench["run_summary"]["warm_a"]["breakeven_reuses"]["mean"] == 2.0);
+
+    let md = benchmark::generate_markdown(&bench);
+    assert!(md.contains("Steps handed back"));
+    assert!(md.contains("Model calls"));
+    assert!(md.contains("List price (USD)"));
+    assert!(md.contains("Compilation (USD)"));
+    assert!(md.contains("Break-even reuses"));
+
+    let runs = review::find_runs_with_options(&ws, 0, true).unwrap();
+    let html = review::generate_html(&runs, "demo-cache", &json!({}), Some(&bench), true).unwrap();
+    assert!(!html.contains("fonts.googleapis.com"));
+    assert!(!html.contains("__BOOT_URL__"));
+    assert!(html.contains("prefers-color-scheme: dark"));
+    assert!(html.contains("eval-load-error"));
+    assert!(html.contains("run-select"));
+    assert!(html.contains("Steps handed back"));
+    assert!(!html.contains("<iframe src="), "viewer HTML must not use CSP-blocked PDF iframes");
+
+    // eval-set-review produces hardened standalone HTML without Google Fonts
+    let skill_dir = tmp.path().join("demo-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo-skill\ndescription: Evaluate reports.\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let eval_set_file = tmp.path().join("evals.json");
+    std::fs::write(
+        &eval_set_file,
+        r#"[{"query":"check pdf","should_trigger":true}]"#,
+    )
+    .unwrap();
+    let es_html = tmp.path().join("eval-set.html");
+    let es_out = review::eval_set_execute(&json!({
+        "skill_path": skill_dir,
+        "eval_set": eval_set_file,
+        "output": es_html,
+    }))
+    .unwrap();
+    assert_eq!(es_out["_cli"]["code"], 0);
+    let rendered_es = std::fs::read_to_string(&es_html).unwrap();
+    assert!(!rendered_es.contains("fonts.googleapis.com"));
+    assert!(!rendered_es.contains("__BOOT_URL__"));
+    assert!(rendered_es.contains("flushEditorInputs"));
 }

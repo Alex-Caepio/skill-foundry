@@ -19,9 +19,11 @@ libc = "=0.2.191"
 ooxml-numfmt = { path = "vendor/ooxml-numfmt" }
 quick-xml = "0.38"
 regex = "1"
+rusqlite = { version = "=0.37.0", features = ["bundled", "modern_sqlite"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150", features = ["preserve_order"] }
 serde_yaml = "0.9"
+sha2 = "=0.11.0"
 tempfile = "=3.27.0"
 tiny_http = "0.12"
 uuid = { version = "=1.22.0", features = ["v4"] }
