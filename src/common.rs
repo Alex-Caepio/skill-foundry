@@ -78,16 +78,30 @@ pub fn safe_canonicalize(path: &Path) -> Result<PathBuf> {
     fs::canonicalize(path).map_err(RuntimeError::from)
 }
 
-/// Detect whether `dir` is a packaged plugin root (Claude/Codex manifest + plugin binary)
+/// Detect whether `dir` is a packaged plugin root (Claude/Codex/Antigravity manifest + plugin binary)
 /// so MCP/root discovery never walks up out of a plugin cache directory into `$HOME` or a marketplace root.
 pub fn is_plugin_dir(dir: &Path) -> bool {
     (dir.join(".codex-plugin/plugin.json").is_file()
-        || dir.join(".claude-plugin/plugin.json").is_file())
+        || dir.join(".claude-plugin/plugin.json").is_file()
+        || dir.join(".antigravity-plugin/plugin.json").is_file()
+        || dir.join(".gemini-plugin/plugin.json").is_file()
+        || dir.join("plugin.json").is_file()
+        || dir.join(".mcp.json").is_file()
+        || dir.join("mcp_config.json").is_file())
         && dir.join("bin/skill-foundry").exists()
 }
 
 pub fn inside_plugin_dir(dir: &Path) -> bool {
-    dir.ancestors().any(is_plugin_dir)
+    if dir.ancestors().any(is_plugin_dir) {
+        return true;
+    }
+    let norm = dir.to_string_lossy().replace('\\', "/");
+    norm.contains("/.gemini/config/plugins/")
+        || norm.ends_with("/.gemini/config/plugins")
+        || norm.contains("/.claude/plugins/cache/")
+        || norm.ends_with("/.claude/plugins/cache")
+        || norm.contains("/.codex/plugins/cache/")
+        || norm.ends_with("/.codex/plugins/cache")
 }
 
 /// Ensure a relative path resolves strictly inside `root` without escaping via `..` or symlinks.

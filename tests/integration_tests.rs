@@ -287,6 +287,72 @@ fn binary_mcp_refuses_omitted_or_dot_path_from_plugin_cwd_with_ancestor_markers(
 }
 
 #[test]
+fn binary_mcp_refuses_omitted_or_dot_path_from_antigravity_plugin_dir() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_root = tmp.path().join("home/.gemini/config/plugins/skill-foundry");
+    std::fs::create_dir_all(plugin_root.join("bin")).unwrap();
+    std::fs::write(plugin_root.join("plugin.json"), r#"{"name":"skill-foundry"}"#).unwrap();
+    std::fs::write(plugin_root.join("mcp_config.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(plugin_root.join("bin/skill-foundry"), "").unwrap();
+
+    // Also verify .antigravity-plugin/plugin.json detection outside ~/.gemini/config/plugins
+    let agy_manifest_dir = tmp.path().join("alt-agy-plugin");
+    std::fs::create_dir_all(agy_manifest_dir.join(".antigravity-plugin")).unwrap();
+    std::fs::create_dir_all(agy_manifest_dir.join("bin")).unwrap();
+    std::fs::write(
+        agy_manifest_dir.join(".antigravity-plugin/plugin.json"),
+        r#"{"name":"skill-foundry"}"#,
+    )
+    .unwrap();
+    std::fs::write(agy_manifest_dir.join("bin/skill-foundry"), "").unwrap();
+    assert!(skill_foundry::common::is_plugin_dir(&agy_manifest_dir));
+    assert!(skill_foundry::common::inside_plugin_dir(&plugin_root));
+
+    let ext_skill = tmp.path().join("workspace/agy-demo");
+    std::fs::create_dir_all(&ext_skill).unwrap();
+    std::fs::write(
+        ext_skill.join("SKILL.md"),
+        "---\nname: agy-demo\ndescription: Safe Antigravity plugin-cwd guard test.\n---\n\nBody.\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_skill-foundry"))
+        .arg("mcp")
+        .current_dir(&plugin_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let payload = format!(
+        concat!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"agy","version":"1"}}}}}}"#, "\n",
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#, "\n",
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"skill_vet","arguments":{{}}}}}}"#, "\n",
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"skill_validate","arguments":{{"path":"."}}}}}}"#, "\n",
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"skill_budget_check","arguments":{{"path":"./."}}}}}}"#, "\n",
+            r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"skill_validate","arguments":{{"path":"{0}"}}}}}}"#, "\n"
+        ),
+        ext_skill.display()
+    );
+    child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<serde_json::Value> = stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 5);
+    assert_eq!(lines[1]["result"]["isError"], true);
+    assert_eq!(lines[2]["result"]["isError"], true);
+    assert_eq!(lines[3]["result"]["isError"], true);
+    assert_eq!(lines[4]["id"], 5);
+    assert_eq!(lines[4]["result"]["isError"], false);
+    assert_eq!(lines[4]["result"]["structuredContent"]["valid"], true);
+}
+
+#[test]
 fn evaluation_query_memo_cache_persists_in_sqlite_and_prefilter_blocks_secrets() {
     use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
     use std::time::Duration;
